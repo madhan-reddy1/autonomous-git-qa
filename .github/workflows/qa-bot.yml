@@ -1,0 +1,38 @@
+name: Autonomous QA Bot
+
+on:
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  autonomous-ui-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+
+      - name: Run Autonomous QA Bot
+        env:
+          TARGET_URL: "https://example.com"
+        run: node bot.js
+
+      - name: Upload Failure Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-failure-artifacts
+          path: |
+            failure-snapshot.png
+            crash-snapshot.png
+            pr-comment.md
