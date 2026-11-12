@@ -2,25 +2,41 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-async function runTestBot() {
-  const targetUrl = process.env.TARGET_URL || 'https://example.com';
-  console.log(`🤖 Autonomous Bot running checks against: ${targetUrl}`);
+// One URL via TARGET_URL, or several comma-separated via TARGET_URLS.
+function getTargetUrls() {
+  const multi = process.env.TARGET_URLS;
+  if (multi) return multi.split(',').map((u) => u.trim()).filter(Boolean);
+  return [process.env.TARGET_URL || 'https://example.com'];
+}
 
-  const browser = await chromium.launch({ headless: true });
+async function checkUrl(browser, targetUrl) {
+  console.log(`🤖 Checking: ${targetUrl}`);
+
   const context = await browser.newContext();
   const page = await context.newPage();
 
   const consoleErrors = [];
-  page.on('console', msg => {
+  const failedRequests = [];
+  const badResponses = [];
+
+  page.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(msg.text());
   });
 
-  const failedRequests = [];
-  page.on('requestfailed', request => {
-    failedRequests.push(`${request.method()} ${request.url()} - ${request.failure()?.errorText || 'Unknown error'}`);
+  page.on('requestfailed', (request) => {
+    failedRequests.push(
+      `${request.method()} ${request.url()} - ${request.failure()?.errorText || 'Unknown error'}`
+    );
   });
 
-  let testStatus = 'PASS';
+  // A 404/500 that completes is NOT a 'requestfailed' event — catch it here.
+  page.on('response', (response) => {
+    if (response.status() >= 400) {
+      badResponses.push(`${response.request().method()} ${response.url()} - HTTP ${response.status()}`);
+    }
+  });
+
+  let status = 'PASS';
   let failureDetails = '';
   let screenshotPath = '';
 
@@ -32,42 +48,66 @@ async function runTestBot() {
       throw new Error('Page title is missing or empty.');
     }
 
-    if (consoleErrors.length > 0 || failedRequests.length > 0) {
-      testStatus = 'FAIL';
+    const problems = consoleErrors.length + failedRequests.length + badResponses.length;
+    if (problems > 0) {
+      status = 'FAIL';
       screenshotPath = path.join(__dirname, 'failure-snapshot.png');
       await page.waitForTimeout(500);
       await page.screenshot({ path: screenshotPath, fullPage: true });
-      failureDetails = `Detected ${consoleErrors.length} console errors and ${failedRequests.length} failed network requests.`;
+      failureDetails = `Detected ${consoleErrors.length} console errors, ${failedRequests.length} failed network requests, and ${badResponses.length} broken (4xx/5xx) responses.`;
     }
   } catch (error) {
-    testStatus = 'FAIL';
+    status = 'FAIL';
     screenshotPath = path.join(__dirname, 'failure-snapshot.png');
     await page.waitForTimeout(500);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     failureDetails = error.message;
-    console.error("Test failed, captured failure-snapshot.png:", error.message);
+    console.error('Test failed, captured failure-snapshot.png:', error.message);
   } finally {
-    await browser.close();
+    await context.close();
   }
 
-  generatePRComment(testStatus, targetUrl, consoleErrors, failedRequests, failureDetails);
+  return { url: targetUrl, status, consoleErrors, failedRequests, badResponses, failureDetails };
 }
 
-function generatePRComment(status, url, errors, requests, details) {
-  let markdown = '';
+function generatePRComment(results) {
+  const failed = results.filter((r) => r.status === 'FAIL');
+  const overall = failed.length === 0 ? 'PASS' : 'FAIL';
 
-  if (status === 'PASS') {
-    markdown = `### 🤖 Autonomous QA Bot: PASSED\n**Target URL:** ${url}\n**Result:** All checks completed successfully with zero console errors or failed API requests. Ready for merge!`;
+  let markdown = '';
+  if (overall === 'PASS') {
+    const lines = results
+      .map((r) => `- ✅ ${r.url} — no console errors, no failed requests, no broken responses.`)
+      .join('\n');
+    markdown = `### 🤖 Autonomous QA Bot: PASSED\n${lines}\n**Result:** All checks completed successfully. Ready for merge!`;
   } else {
-    markdown = `### ❌ Autonomous QA Bot: FAILED (Launch Blockers Found)\n**Target URL:** ${url}\n**Reason:** ${details}\n\n**Console Errors:**\n\`\`\`text\n${JSON.stringify(errors, null, 2)}\n\`\`\`\n\n**Failed Network Requests:**\n\`\`\`text\n${JSON.stringify(requests, null, 2)}\n\`\`\``;
+    const sections = failed
+      .map(
+        (r) =>
+          `**Target URL:** ${r.url}\n**Reason:** ${r.failureDetails}\n\n**Console Errors:**\n\`\`\`text\n${JSON.stringify(r.consoleErrors, null, 2)}\n\`\`\`\n\n**Failed Network Requests:**\n\`\`\`text\n${JSON.stringify(r.failedRequests, null, 2)}\n\`\`\`\n\n**Broken Responses (4xx/5xx):**\n\`\`\`text\n${JSON.stringify(r.badResponses, null, 2)}\n\`\`\``
+      )
+      .join('\n\n---\n\n');
+    markdown = `### ❌ Autonomous QA Bot: FAILED (Launch Blockers Found)\n${sections}`;
   }
 
   const outputPath = path.join(__dirname, 'pr-comment.md');
   fs.writeFileSync(outputPath, markdown);
   console.log(`\n📄 PR Comment Markdown generated successfully at: ${outputPath}`);
-  
-  if (status === 'FAIL') {
-    process.exit(1);
+  return overall;
+}
+
+async function runTestBot() {
+  const urls = getTargetUrls();
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const results = [];
+    for (const url of urls) {
+      results.push(await checkUrl(browser, url));
+    }
+    const overall = generatePRComment(results);
+    if (overall === 'FAIL') process.exit(1);
+  } finally {
+    await browser.close();
   }
 }
 

@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Generated outputs (created on each run)
+pr-comment.md
+failure-snapshot.png
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
